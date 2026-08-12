@@ -103,35 +103,51 @@ final class NotchModel: ObservableObject {
         case .notification:
             // Claude Code fires this hook both for real prompts (permissions, selections —
             // always mid-turn) and for "waiting for your input" idle nags ~60s after a turn
-            // already ended. The payload doesn't distinguish them; the turn lifecycle does:
-            // only honor it while the session is still working (unknown sessions pass, so a
-            // real prompt is never dropped after an app restart).
-            let midTurn = sessions.first { $0.id == ev.sessionId }.map { $0.state == .working } ?? true
-            guard midTurn else { break }
-            upsert(ev) { $0.state = .waiting; $0.term = ev.term ?? $0.term }
+            // already ended. The payload doesn't distinguish them; the turn lifecycle does.
+            // .waiting is also mid-turn: answering a prompt fires no hook, so a second prompt
+            // in the same turn must still banner. Only .idle means the turn is over.
+            let knownState = sessions.first { $0.id == ev.sessionId }?.state
+            if knownState == .idle { break }
+            if knownState != nil {
+                upsert(ev) { $0.state = .waiting; $0.term = ev.term ?? $0.term }
+            } else {
+                // unknown session (app restarted): banner it, but don't fabricate a stuck
+                // .waiting session — an idle session never fires another hook to clear it
+                upsert(ev) { $0.term = ev.term ?? $0.term }
+            }
             peekTrigger += 1
             showBanner(TaskEvent(title: ev.project,
                                  subtitle: ev.message ?? "Claude needs your input",
                                  needsInput: true, term: ev.term),
                        for: 15, sound: "Funk")
         case .stop:
-            let stats = TranscriptStats.parse(ev.transcriptPath)
-            upsert(ev) {
-                $0.state = .idle
-                $0.model = stats.model ?? $0.model
-                $0.term = ev.term ?? $0.term
+            let startedBefore = sessions.first { $0.id == ev.sessionId }?.taskStartedAt
+            let path = ev.transcriptPath
+            Task { [weak self] in
+                // transcripts grow to tens of MB — parse off the main actor
+                let stats = await Task.detached(priority: .utility) { TranscriptStats.parse(path) }.value
+                self?.applyStop(ev, stats, startedBefore: startedBefore)
             }
-            completions.insert(Completion(project: ev.project, finishedAt: .now, usage: stats.lastUsage), at: 0)
-            completions = Array(completions.prefix(5))
-            addToday(session: ev.sessionId, input: stats.todayIn, output: stats.todayOut)
-            let what = stats.lastText.isEmpty ? "Task completed" : stats.lastText
-            let subtitle = stats.lastUsage.isEmpty ? what : "\(what) · \(stats.lastUsage)"
-            showBanner(TaskEvent(title: ev.project, subtitle: subtitle, term: ev.term),
-                       for: 9, sound: "Pop")
-            refreshLimits()
         case .sessionEnd:
             sessions.removeAll { $0.id == ev.sessionId }
         }
+    }
+
+    private func applyStop(_ ev: HookEvent, _ stats: TranscriptStats, startedBefore: Date?) {
+        upsert(ev) {
+            // a newer prompt may have arrived while parsing — don't clobber its working state
+            if $0.taskStartedAt == startedBefore { $0.state = .idle }
+            $0.model = stats.model ?? $0.model
+            $0.term = ev.term ?? $0.term
+        }
+        completions.insert(Completion(project: ev.project, finishedAt: .now, usage: stats.lastUsage), at: 0)
+        completions = Array(completions.prefix(5))
+        addToday(session: ev.sessionId, input: stats.todayIn, output: stats.todayOut)
+        let what = stats.lastText.isEmpty ? "Task completed" : stats.lastText
+        let subtitle = stats.lastUsage.isEmpty ? what : "\(what) · \(stats.lastUsage)"
+        showBanner(TaskEvent(title: ev.project, subtitle: subtitle, term: ev.term),
+                   for: 9, sound: "Pop")
+        refreshLimits()
     }
 
     private func upsert(_ ev: HookEvent, _ mutate: (inout SessionInfo) -> Void) {
@@ -233,7 +249,7 @@ final class NotchModel: ObservableObject {
         p.arguments = ["find-generic-password", "-s", "Claude Code-credentials", "-w"]
         let pipe = Pipe()
         p.standardOutput = pipe
-        p.standardError = Pipe()
+        p.standardError = FileHandle.nullDevice // an unread stderr pipe can deadlock the child
         guard (try? p.run()) != nil else { return nil }
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
         p.waitUntilExit()
@@ -260,7 +276,20 @@ final class NotchModel: ObservableObject {
         }
     }
 
+    // Banners queue instead of clobbering — a needs-input banner must not be
+    // erased by another session's completion.
+    private var bannerQueue: [(TaskEvent, Double, String)] = []
+    private var bannerActive = false
+
     private func showBanner(_ event: TaskEvent, for seconds: Double, sound: String) {
+        bannerQueue.append((event, seconds, sound))
+        if !bannerActive { showNextBanner() }
+    }
+
+    private func showNextBanner() {
+        guard !bannerQueue.isEmpty else { bannerActive = false; return }
+        bannerActive = true
+        let (event, seconds, sound) = bannerQueue.removeFirst()
         if !UserDefaults.standard.bool(forKey: "soundOff") {
             NSSound(named: sound)?.play()
         }
@@ -270,6 +299,8 @@ final class NotchModel: ObservableObject {
             try? await Task.sleep(for: .seconds(seconds))
             guard !Task.isCancelled else { return }
             withAnimation(.easeIn(duration: 0.3)) { current = nil }
+            try? await Task.sleep(for: .seconds(0.4))
+            showNextBanner()
         }
     }
 }
@@ -322,26 +353,38 @@ final class EventWatcher {
     private let dir = FileManager.default.homeDirectoryForCurrentUser
         .appending(path: ".notchification/events")
     private var source: DispatchSourceFileSystemObject?
-    private let onEvent: (HookEvent) -> Void
+    private let onEvent: ([HookEvent]) -> Void
+    // one serial queue for every drain: no double-processing, and batches stay ordered
+    private let queue = DispatchQueue(label: "notchification.events")
 
-    init(onEvent: @escaping (HookEvent) -> Void) {
+    init(onEvent: @escaping ([HookEvent]) -> Void) {
         self.onEvent = onEvent
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        // 0700: event files carry project/transcript paths and terminal sockets — user-only
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true,
+                                                 attributes: [.posixPermissions: 0o700])
+        try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: dir.path)
         let fd = open(dir.path, O_EVTONLY)
         guard fd >= 0 else { return }
         let src = DispatchSource.makeFileSystemObjectSource(fileDescriptor: fd, eventMask: .write,
-                                                            queue: .global(qos: .utility))
+                                                            queue: queue)
         src.setEventHandler { [weak self] in self?.drain() }
         src.setCancelHandler { close(fd) }
         src.resume()
         source = src
-        drain()
+        queue.async { [weak self] in self?.drain() }
     }
 
     private func drain() {
-        guard let files = try? FileManager.default.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil)
+        guard let files = try? FileManager.default.contentsOfDirectory(
+            at: dir, includingPropertiesForKeys: [.contentModificationDateKey])
         else { return }
-        for url in files.sorted(by: { $0.lastPathComponent < $1.lastPathComponent })
+        func mtime(_ u: URL) -> Date {
+            (try? u.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate
+                ?? .distantPast
+        }
+        var events: [HookEvent] = []
+        // mtime has sub-second resolution; same-second filenames sort by PID and lie about order
+        for url in files.sorted(by: { mtime($0) < mtime($1) })
         where url.pathExtension == "json" {
             defer { try? FileManager.default.removeItem(at: url) }
             guard let data = try? Data(contentsOf: url),
@@ -365,12 +408,13 @@ final class EventWatcher {
             }
             let cwd = (obj["cwd"] as? String ?? "") as NSString
             let project = cwd.lastPathComponent.isEmpty ? "Claude Code" : cwd.lastPathComponent
-            onEvent(HookEvent(kind: kind,
-                              sessionId: obj["session_id"] as? String ?? UUID().uuidString,
-                              project: project,
-                              transcriptPath: obj["transcript_path"] as? String,
-                              message: obj["message"] as? String,
-                              term: term))
+            events.append(HookEvent(kind: kind,
+                                    sessionId: obj["session_id"] as? String ?? UUID().uuidString,
+                                    project: project,
+                                    transcriptPath: obj["transcript_path"] as? String,
+                                    message: obj["message"] as? String,
+                                    term: term))
         }
+        if !events.isEmpty { onEvent(events) }
     }
 }

@@ -22,51 +22,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var watcher: EventWatcher!
     var screenFrame = NSRect.zero
     var mouseMonitor: Any?
+    var localMouseMonitor: Any?
     var cancellables = Set<AnyCancellable>()
     var statusItem: NSStatusItem!
     var updateItem: NSMenuItem!
+    var pendingUpdateTag: String?
+
+    static let panelSize = NSSize(width: 760, height: 420)
+    static let bannerSize = NSSize(width: 480, height: 150)
 
     func applicationDidFinishLaunching(_ note: Notification) {
-        let screen = NSScreen.screens.first { $0.safeAreaInsets.top > 0 } ?? NSScreen.main!
-        screenFrame = screen.frame
-        if screen.safeAreaInsets.top > 0 {
-            model.notchHeight = screen.safeAreaInsets.top
-        }
-        if let left = screen.auxiliaryTopLeftArea, let right = screen.auxiliaryTopRightArea {
-            model.notchWidth = right.minX - left.maxX
-        }
-
-        let size = NSSize(width: 760, height: 420)
-        let origin = NSPoint(x: screenFrame.midX - size.width / 2,
-                             y: screenFrame.maxY - size.height)
-        panel = NSPanel(contentRect: NSRect(origin: origin, size: size),
-                        styleMask: [.borderless, .nonactivatingPanel],
-                        backing: .buffered, defer: false)
-        panel.level = .statusBar
-        panel.backgroundColor = .clear
-        panel.isOpaque = false
-        panel.hasShadow = false
-        panel.ignoresMouseEvents = true
-        panel.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary]
-        panel.contentView = NSHostingView(rootView: OverlayView(model: model, panelSize: size))
-        panel.orderFrontRegardless()
+        panel = Self.makePanel(size: Self.panelSize)
+        panel.contentView = NSHostingView(rootView: OverlayView(model: model, panelSize: Self.panelSize))
 
         // Small separate panel for the banner so it can take clicks (focus the terminal)
         // while everything else stays click-through.
-        let bSize = NSSize(width: 480, height: 150)
-        bannerPanel = NSPanel(contentRect: NSRect(x: screenFrame.midX - bSize.width / 2,
-                                                  y: screenFrame.maxY - bSize.height,
-                                                  width: bSize.width, height: bSize.height),
-                              styleMask: [.borderless, .nonactivatingPanel],
-                              backing: .buffered, defer: false)
-        bannerPanel.level = .statusBar
-        bannerPanel.backgroundColor = .clear
-        bannerPanel.isOpaque = false
-        bannerPanel.hasShadow = false
-        bannerPanel.ignoresMouseEvents = true
-        bannerPanel.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary]
+        bannerPanel = Self.makePanel(size: Self.bannerSize)
         bannerPanel.contentView = NSHostingView(rootView: BannerHost(model: model))
+
+        layoutPanels()
+        panel.orderFrontRegardless()
         bannerPanel.orderFrontRegardless()
+
+        NotificationCenter.default.addObserver(
+            forName: NSApplication.didChangeScreenParametersNotification,
+            object: nil, queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in self?.layoutPanels() }
+        }
 
         model.$current
             .receive(on: DispatchQueue.main)
@@ -74,12 +57,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             .store(in: &cancellables)
 
         let model = self.model
-        watcher = EventWatcher { event in
-            Task { @MainActor in model.handle(event) }
+        watcher = EventWatcher { events in
+            Task { @MainActor in events.forEach { model.handle($0) } }
         }
 
         mouseMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.mouseMoved]) { _ in
             DispatchQueue.main.async { [weak self] in self?.checkHover() }
+        }
+        // global monitors skip events delivered to our own windows (e.g. over the banner panel)
+        localMouseMonitor = NSEvent.addLocalMonitorForEvents(matching: [.mouseMoved]) { [weak self] e in
+            DispatchQueue.main.async { self?.checkHover() }
+            return e
         }
 
         setupStatusItem()
@@ -97,57 +85,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    // MARK: - Auto-update (repo commit vs installed sha, via gh)
-
-    nonisolated static let repoSlug = "spencer-osbrjp/notchification"
-    nonisolated static var repoPath: String {
-        UserDefaults.standard.string(forKey: "repoPath")
-            ?? NSHomeDirectory() + "/Documents/Works/OSBR/notchification"
+    private static func makePanel(size: NSSize) -> NSPanel {
+        let p = NSPanel(contentRect: NSRect(origin: .zero, size: size),
+                        styleMask: [.borderless, .nonactivatingPanel],
+                        backing: .buffered, defer: false)
+        p.level = .statusBar
+        p.backgroundColor = .clear
+        p.isOpaque = false
+        p.hasShadow = false
+        p.ignoresMouseEvents = true
+        p.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary]
+        return p
     }
 
-    private func checkForUpdates() {
-        // dev runs (swift run) carry no baked sha — skip
-        guard let shaURL = Bundle.main.url(forResource: "sha", withExtension: nil),
-              let installed = try? String(contentsOf: shaURL, encoding: .utf8)
-                  .trimmingCharacters(in: .whitespacesAndNewlines)
-        else { return }
-        Task.detached {
-            guard let gh = ["/opt/homebrew/bin/gh", "/usr/local/bin/gh", "/usr/bin/gh"]
-                .first(where: { FileManager.default.isExecutableFile(atPath: $0) }),
-                  let remote = Self.shell(gh, ["api", "repos/\(Self.repoSlug)/commits/main", "--jq", ".sha"])?
-                      .trimmingCharacters(in: .whitespacesAndNewlines),
-                  remote.count == 40, remote != installed
-            else { return }
-            await MainActor.run {
-                self.updateItem.isHidden = false
-                self.updateItem.title = "Install update (\(remote.prefix(7)))…"
-                self.model.notice("Update available — install from the menu bar icon")
-            }
+    /// Called at launch and whenever displays change (dock/undock, sleep, resolution).
+    private func layoutPanels() {
+        guard let screen = NSScreen.screens.first(where: { $0.safeAreaInsets.top > 0 })
+            ?? NSScreen.main ?? NSScreen.screens.first else { return }
+        screenFrame = screen.frame
+        if screen.safeAreaInsets.top > 0 {
+            model.notchHeight = screen.safeAreaInsets.top
         }
-    }
-
-    @objc private func installUpdate() {
-        updateItem.title = "Updating…"
-        updateItem.action = nil
-        Task.detached {
-            _ = Self.shell("/usr/bin/git", ["-C", Self.repoPath, "pull", "--ff-only"])
-            _ = Self.shell("/usr/bin/make", ["-C", Self.repoPath, "install"])
-            await MainActor.run { NSApp.terminate(nil) } // make install already opened the new build
+        if let left = screen.auxiliaryTopLeftArea, let right = screen.auxiliaryTopRightArea {
+            model.notchWidth = right.minX - left.maxX
         }
+        panel.setFrame(NSRect(x: screenFrame.midX - Self.panelSize.width / 2,
+                              y: screenFrame.maxY - Self.panelSize.height,
+                              width: Self.panelSize.width, height: Self.panelSize.height),
+                       display: true)
+        bannerPanel.setFrame(NSRect(x: screenFrame.midX - Self.bannerSize.width / 2,
+                                    y: screenFrame.maxY - Self.bannerSize.height,
+                                    width: Self.bannerSize.width, height: Self.bannerSize.height),
+                             display: true)
     }
 
-    nonisolated private static func shell(_ path: String, _ args: [String]) -> String? {
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: path)
-        p.arguments = args
-        let pipe = Pipe()
-        p.standardOutput = pipe
-        p.standardError = Pipe()
-        guard (try? p.run()) != nil else { return nil }
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        p.waitUntilExit()
-        return p.terminationStatus == 0 ? String(data: data, encoding: .utf8) : nil
-    }
+    // MARK: - Menu bar
 
     private func setupStatusItem() {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
@@ -219,6 +191,90 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         return img
     }
 
+    // MARK: - Auto-update (installed sha vs latest release, installs the release artifact)
+
+    nonisolated static let repoSlug = "spencer-osbrjp/notchification"
+
+    nonisolated private static func ghPath() -> String? {
+        ["/opt/homebrew/bin/gh", "/usr/local/bin/gh", "/usr/bin/gh"]
+            .first { FileManager.default.isExecutableFile(atPath: $0) }
+    }
+
+    private func checkForUpdates() {
+        // dev runs (swift run) carry no baked sha — skip
+        guard let shaURL = Bundle.main.url(forResource: "sha", withExtension: nil),
+              let installed = try? String(contentsOf: shaURL, encoding: .utf8)
+                  .trimmingCharacters(in: .whitespacesAndNewlines)
+        else { return }
+        Task.detached {
+            guard let gh = Self.ghPath(),
+                  let tag = Self.shell(gh, ["release", "view", "--repo", Self.repoSlug,
+                                            "--json", "tagName", "--jq", ".tagName"])?
+                      .trimmingCharacters(in: .whitespacesAndNewlines),
+                  !tag.isEmpty,
+                  let remote = Self.shell(gh, ["api", "repos/\(Self.repoSlug)/commits/\(tag)",
+                                               "--jq", ".sha"])?
+                      .trimmingCharacters(in: .whitespacesAndNewlines),
+                  remote.count == 40, remote != installed
+            else { return }
+            await MainActor.run {
+                self.pendingUpdateTag = tag
+                self.updateItem.isHidden = false
+                self.updateItem.title = "Install update (\(tag))…"
+                self.model.notice("Update \(tag) available — install from the menu bar icon")
+            }
+        }
+    }
+
+    @objc private func installUpdate() {
+        guard let tag = pendingUpdateTag else { return }
+        updateItem.title = "Updating…"
+        updateItem.action = nil
+        Task.detached {
+            let ok: Bool = {
+                guard let gh = Self.ghPath() else { return false }
+                let tmp = NSTemporaryDirectory() + "notchification-update"
+                try? FileManager.default.removeItem(atPath: tmp)
+                guard Self.shell(gh, ["release", "download", tag, "--repo", Self.repoSlug,
+                                      "--pattern", "Notchification.app.zip", "--dir", tmp]) != nil,
+                      Self.shell("/usr/bin/ditto", ["-x", "-k",
+                                                    tmp + "/Notchification.app.zip",
+                                                    "/Applications"]) != nil
+                else { return false }
+                return true
+            }()
+            await MainActor.run {
+                if ok {
+                    // relaunch after this instance exits — a plain `open` would only activate us
+                    let p = Process()
+                    p.executableURL = URL(fileURLWithPath: "/bin/sh")
+                    p.arguments = ["-c", "sleep 1; /usr/bin/open /Applications/Notchification.app"]
+                    try? p.run()
+                    NSApp.terminate(nil)
+                } else {
+                    self.model.notice("Update failed — try again from the menu bar")
+                    self.updateItem.title = "Install update (\(tag))…"
+                    self.updateItem.action = #selector(self.installUpdate)
+                }
+            }
+        }
+    }
+
+    nonisolated static func shell(_ path: String, _ args: [String]) -> String? {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: path)
+        p.arguments = args
+        let pipe = Pipe()
+        p.standardOutput = pipe
+        p.standardError = FileHandle.nullDevice // an unread stderr pipe can deadlock the child
+        guard (try? p.run()) != nil else { return nil }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+        return p.terminationStatus == 0 ? String(data: data, encoding: .utf8) : nil
+    }
+
+    // MARK: - Hover
+
     /// Expand on hover over the notch (or the character when it's out); collapse when the mouse leaves.
     private func checkHover() {
         let loc = NSEvent.mouseLocation
@@ -228,7 +284,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                                height: model.notchHeight)
         let hot: NSRect
         if model.expanded {
-            hot = NSRect(x: screenFrame.midX - 200, y: screenFrame.maxY - 340, width: 400, height: 340)
+            // generous: taller than the tallest panel content — over-holding is benign,
+            // collapsing under the cursor is not
+            hot = NSRect(x: screenFrame.midX - 210, y: screenFrame.maxY - 500, width: 420, height: 500)
         } else if model.characterOut {
             hot = notchRect.insetBy(dx: -110, dy: 0)
         } else {
