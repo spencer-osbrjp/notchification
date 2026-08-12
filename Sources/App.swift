@@ -24,6 +24,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var mouseMonitor: Any?
     var cancellables = Set<AnyCancellable>()
     var statusItem: NSStatusItem!
+    var updateItem: NSMenuItem!
 
     func applicationDidFinishLaunching(_ note: Notification) {
         let screen = NSScreen.screens.first { $0.safeAreaInsets.top > 0 } ?? NSScreen.main!
@@ -82,6 +83,70 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         setupStatusItem()
+
+        // installed builds register as a login item once; the menu toggle stays in control after
+        if Bundle.main.bundlePath.hasPrefix("/Applications"),
+           !UserDefaults.standard.bool(forKey: "didAutoLogin") {
+            UserDefaults.standard.set(true, forKey: "didAutoLogin")
+            try? SMAppService.mainApp.register()
+        }
+
+        checkForUpdates()
+        Timer.scheduledTimer(withTimeInterval: 4 * 3600, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.checkForUpdates() }
+        }
+    }
+
+    // MARK: - Auto-update (repo commit vs installed sha, via gh)
+
+    nonisolated static let repoSlug = "spencer-osbrjp/notchification"
+    nonisolated static var repoPath: String {
+        UserDefaults.standard.string(forKey: "repoPath")
+            ?? NSHomeDirectory() + "/Documents/Works/OSBR/notchification"
+    }
+
+    private func checkForUpdates() {
+        // dev runs (swift run) carry no baked sha — skip
+        guard let shaURL = Bundle.main.url(forResource: "sha", withExtension: nil),
+              let installed = try? String(contentsOf: shaURL, encoding: .utf8)
+                  .trimmingCharacters(in: .whitespacesAndNewlines)
+        else { return }
+        Task.detached {
+            guard let gh = ["/opt/homebrew/bin/gh", "/usr/local/bin/gh", "/usr/bin/gh"]
+                .first(where: { FileManager.default.isExecutableFile(atPath: $0) }),
+                  let remote = Self.shell(gh, ["api", "repos/\(Self.repoSlug)/commits/main", "--jq", ".sha"])?
+                      .trimmingCharacters(in: .whitespacesAndNewlines),
+                  remote.count == 40, remote != installed
+            else { return }
+            await MainActor.run {
+                self.updateItem.isHidden = false
+                self.updateItem.title = "Install update (\(remote.prefix(7)))…"
+                self.model.notice("Update available — install from the menu bar icon")
+            }
+        }
+    }
+
+    @objc private func installUpdate() {
+        updateItem.title = "Updating…"
+        updateItem.action = nil
+        Task.detached {
+            _ = Self.shell("/usr/bin/git", ["-C", Self.repoPath, "pull", "--ff-only"])
+            _ = Self.shell("/usr/bin/make", ["-C", Self.repoPath, "install"])
+            await MainActor.run { NSApp.terminate(nil) } // make install already opened the new build
+        }
+    }
+
+    nonisolated private static func shell(_ path: String, _ args: [String]) -> String? {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: path)
+        p.arguments = args
+        let pipe = Pipe()
+        p.standardOutput = pipe
+        p.standardError = Pipe()
+        guard (try? p.run()) != nil else { return nil }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+        return p.terminationStatus == 0 ? String(data: data, encoding: .utf8) : nil
     }
 
     private func setupStatusItem() {
@@ -109,6 +174,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(login)
 
         menu.addItem(.separator())
+        updateItem = NSMenuItem(title: "Install update…", action: #selector(installUpdate), keyEquivalent: "")
+        updateItem.target = self
+        updateItem.isHidden = true
+        menu.addItem(updateItem)
         let quit = NSMenuItem(title: "Quit Notchification", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         menu.addItem(quit)
 

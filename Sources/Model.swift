@@ -240,6 +240,11 @@ final class NotchModel: ObservableObject {
         return token(from: data)
     }
 
+    /// App-level notice shown through the banner (e.g. update available).
+    func notice(_ text: String) {
+        showBanner(TaskEvent(title: "Notchification", subtitle: text), for: 8, sound: "Pop")
+    }
+
     /// Click on the banner: focus the exact kitty window when possible, then bring the terminal app front.
     func focusTerminal(_ t: TermInfo?) {
         guard let t else { return }
