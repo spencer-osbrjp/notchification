@@ -113,7 +113,7 @@ final class NotchModel: ObservableObject {
             showBanner(TaskEvent(title: ev.project,
                                  subtitle: ev.message ?? "Claude needs your input",
                                  needsInput: true, term: ev.term),
-                       for: 12, sound: "Funk")
+                       for: 15, sound: "Funk")
         case .stop:
             let stats = TranscriptStats.parse(ev.transcriptPath)
             upsert(ev) {
@@ -127,7 +127,7 @@ final class NotchModel: ObservableObject {
             let what = stats.lastText.isEmpty ? "Task completed" : stats.lastText
             let subtitle = stats.lastUsage.isEmpty ? what : "\(what) · \(stats.lastUsage)"
             showBanner(TaskEvent(title: ev.project, subtitle: subtitle, term: ev.term),
-                       for: 6, sound: "Pop")
+                       for: 9, sound: "Pop")
             refreshLimits()
         case .sessionEnd:
             sessions.removeAll { $0.id == ev.sessionId }
@@ -242,7 +242,7 @@ final class NotchModel: ObservableObject {
 
     /// App-level notice shown through the banner (e.g. update available).
     func notice(_ text: String) {
-        showBanner(TaskEvent(title: "Notchification", subtitle: text), for: 8, sound: "Pop")
+        showBanner(TaskEvent(title: "Notchification", subtitle: text), for: 11, sound: "Pop")
     }
 
     /// Click on the banner: focus the exact kitty window when possible, then bring the terminal app front.

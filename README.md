@@ -54,6 +54,21 @@ Repeat the same hook object under `UserPromptSubmit`, `Notification`, and `Sessi
 
 On first launch, allow the Keychain prompt so the app can read the Claude Code OAuth token for the usage-limit bars (or click Deny — everything else still works).
 
+## Releases & branching
+
+Releases are automated with semantic-release: every qualifying push to `main` analyzes
+[conventional commits](https://www.conventionalcommits.org), bumps the version, publishes a
+GitHub Release with generated notes, and attaches a built `Notchification.app.zip`.
+
+- `feat:` → minor release, `fix:` → patch, `feat!:` / `BREAKING CHANGE:` → major
+- `chore:` / `docs:` / `refactor:` → no release
+
+Branching strategy (weekly cadence, trunk-based):
+
+- **`main` is the release branch.** Anything merged here with a `feat:`/`fix:` commit ships immediately.
+- **Day-to-day work goes on `dev`** (or short-lived feature branches). Merge `dev` → `main` once a week — that merge becomes the weekly release.
+- **Emergency fixes** branch off `main`, land as a single `fix:` commit straight to `main`, and ship as a patch release right away — no waiting for the weekly merge.
+
 ## Future
 
 - Codex / other agent platforms: have them write the same JSON shape (`hook_event_name`, `cwd`, `transcript_path` optional) into `~/.notchification/events/`.
