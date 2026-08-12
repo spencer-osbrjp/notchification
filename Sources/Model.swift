@@ -101,6 +101,13 @@ final class NotchModel: ObservableObject {
             upsert(ev) { $0.state = .working; $0.taskStartedAt = .now; $0.term = ev.term ?? $0.term }
             peekTrigger += 1
         case .notification:
+            // Claude Code fires this hook both for real prompts (permissions, selections —
+            // always mid-turn) and for "waiting for your input" idle nags ~60s after a turn
+            // already ended. The payload doesn't distinguish them; the turn lifecycle does:
+            // only honor it while the session is still working (unknown sessions pass, so a
+            // real prompt is never dropped after an app restart).
+            let midTurn = sessions.first { $0.id == ev.sessionId }.map { $0.state == .working } ?? true
+            guard midTurn else { break }
             upsert(ev) { $0.state = .waiting; $0.term = ev.term ?? $0.term }
             peekTrigger += 1
             showBanner(TaskEvent(title: ev.project,
@@ -117,7 +124,8 @@ final class NotchModel: ObservableObject {
             completions.insert(Completion(project: ev.project, finishedAt: .now, usage: stats.lastUsage), at: 0)
             completions = Array(completions.prefix(5))
             addToday(session: ev.sessionId, input: stats.todayIn, output: stats.todayOut)
-            let subtitle = stats.lastUsage.isEmpty ? "Task completed" : "Task completed · \(stats.lastUsage)"
+            let what = stats.lastText.isEmpty ? "Task completed" : stats.lastText
+            let subtitle = stats.lastUsage.isEmpty ? what : "\(what) · \(stats.lastUsage)"
             showBanner(TaskEvent(title: ev.project, subtitle: subtitle, term: ev.term),
                        for: 6, sound: "Pop")
             refreshLimits()
@@ -264,6 +272,7 @@ final class NotchModel: ObservableObject {
 /// One pass over a session transcript (JSONL): last message usage, model, and today's token totals.
 struct TranscriptStats {
     var lastUsage = ""
+    var lastText = "" // first line of the final assistant message, truncated
     var model: String?
     var todayIn = 0
     var todayOut = 0
@@ -286,6 +295,11 @@ struct TranscriptStats {
             guard fresh + cached + output > 0 else { continue }
             s.model = msg["model"] as? String ?? s.model
             s.lastUsage = "\(fmtTokens(fresh + cached))↑ \(fmtTokens(output))↓ tokens"
+            if let content = msg["content"] as? [[String: Any]],
+               let text = content.last(where: { $0["type"] as? String == "text" })?["text"] as? String {
+                let line = text.split(separator: "\n").first.map(String.init) ?? ""
+                s.lastText = line.count > 70 ? String(line.prefix(70)) + "…" : line
+            }
             // today totals count fresh input + output (cache reads excluded — cheap and huge)
             if let ts = obj["timestamp"] as? String,
                let d = isoFrac.date(from: ts) ?? iso.date(from: ts),
