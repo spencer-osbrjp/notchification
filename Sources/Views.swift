@@ -384,18 +384,22 @@ struct ExpandedView: View {
             } else if model.limits.isEmpty {
                 Text("No limit data").font(Theme.mono(9)).foregroundStyle(Theme.dim)
             } else {
-                LazyVGrid(columns: Array(repeating: GridItem(.flexible(), alignment: .leading), count: 3),
-                          alignment: .leading, spacing: 10) {
-                    ForEach(model.limits) { b in
-                        HStack(spacing: 10) {
-                            Ring(pct: b.pct, accent: b.pct > 0.8 ? .red : Theme.accent(.claude), size: 34)
-                            VStack(alignment: .leading, spacing: 1) {
-                                Text("\(Int(b.pct * 100))%").font(Theme.mono(12)).foregroundStyle(.white)
-                                Text(b.label).font(.system(size: 9, weight: .medium)).foregroundStyle(.white.opacity(0.75))
-                                if let r = b.resetsAt {
-                                    Text(resetText(r)).font(.system(size: 8)).foregroundStyle(Theme.dim)
+                // plain stacks, not LazyVGrid: lazy cells animate their own insertion, which
+                // reads as "fading up" against the panel sliding down
+                ForEach(Array(stride(from: 0, to: model.limits.count, by: 3)), id: \.self) { i in
+                    HStack(spacing: 10) {
+                        ForEach(model.limits[i..<min(i + 3, model.limits.count)]) { b in
+                            HStack(spacing: 10) {
+                                Ring(pct: b.pct, accent: b.pct > 0.8 ? .red : Theme.accent(.claude), size: 34)
+                                VStack(alignment: .leading, spacing: 1) {
+                                    Text("\(Int(b.pct * 100))%").font(Theme.mono(12)).foregroundStyle(.white)
+                                    Text(b.label).font(.system(size: 9, weight: .medium)).foregroundStyle(.white.opacity(0.75))
+                                    if let r = b.resetsAt {
+                                        Text(resetText(r)).font(.system(size: 8)).foregroundStyle(Theme.dim)
+                                    }
                                 }
                             }
+                            .frame(maxWidth: .infinity, alignment: .leading)
                         }
                     }
                 }
