@@ -140,6 +140,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         sound.state = UserDefaults.standard.bool(forKey: "soundOff") ? .off : .on
         menu.addItem(sound)
 
+        let agentsMenu = NSMenu()
+        for (title, tag) in [("All", 0), ("Claude", 1), ("Codex", 2)] {
+            let it = NSMenuItem(title: title, action: #selector(pickAgent(_:)), keyEquivalent: "")
+            it.target = self
+            it.tag = tag
+            agentsMenu.addItem(it)
+        }
+        let agentsItem = NSMenuItem(title: "Agents", action: nil, keyEquivalent: "")
+        agentsItem.submenu = agentsMenu
+        menu.addItem(agentsItem)
+        syncAgentMenu(agentsMenu)
+
         let login = NSMenuItem(title: "Launch at Login", action: #selector(toggleLogin(_:)), keyEquivalent: "")
         login.target = self
         login.state = SMAppService.mainApp.status == .enabled ? .on : .off
@@ -160,6 +172,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let off = !UserDefaults.standard.bool(forKey: "soundOff")
         UserDefaults.standard.set(off, forKey: "soundOff")
         item.state = off ? .off : .on
+    }
+
+    @objc private func pickAgent(_ item: NSMenuItem) {
+        model.setAgentFilter(item.tag == 1 ? .claude : item.tag == 2 ? .codex : nil)
+        if let menu = item.menu { syncAgentMenu(menu) }
+    }
+
+    private func syncAgentMenu(_ menu: NSMenu) {
+        let tag = model.agentFilter == .claude ? 1 : model.agentFilter == .codex ? 2 : 0
+        for it in menu.items { it.state = it.tag == tag ? .on : .off }
     }
 
     @objc private func toggleLogin(_ item: NSMenuItem) {

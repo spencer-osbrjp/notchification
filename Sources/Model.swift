@@ -1,11 +1,20 @@
 import AppKit
 import SwiftUI
 
+/// Which coding agent produced an event. Events without an `agent` field are Claude Code.
+enum Agent: String, CaseIterable {
+    case claude, codex
+    var title: String { self == .claude ? "Claude" : "Codex" }
+}
+
 struct TaskEvent {
     var title: String
     var subtitle: String
     var needsInput = false
     var term: TermInfo?
+    var agent: Agent = .claude
+    var meta: String? // "opus-5 · 2m14s"
+    var pct: Double? // context usage 0...1
 }
 
 struct LimitBucket: Identifiable {
@@ -42,12 +51,14 @@ struct HookEvent {
     var transcriptPath: String?
     var message: String?
     var term: TermInfo?
+    var agent: Agent = .claude
 }
 
 struct SessionInfo: Identifiable {
     enum State { case working, waiting, idle }
     let id: String
     var project: String
+    var agent: Agent = .claude
     var state: State
     var model: String?
     var taskStartedAt: Date?
@@ -58,6 +69,7 @@ struct SessionInfo: Identifiable {
 struct Completion: Identifiable {
     let id = UUID()
     var project: String
+    var agent: Agent = .claude
     var finishedAt: Date
     var usage: String
 }
@@ -76,6 +88,10 @@ final class NotchModel: ObservableObject {
     @Published var todayOut = 0
     @Published var peekTrigger = 0
     @Published var limits: [LimitBucket] = []
+    /// nil = show every agent. Persisted in UserDefaults "agentFilter".
+    @Published var agentFilter: Agent? = UserDefaults.standard.string(forKey: "agentFilter").flatMap(Agent.init)
+    /// Agent of the last shown event — tints the peeking pet.
+    @Published var lastAgent: Agent = .claude
     var characterOut = false // written by the character view, read by the hover check
     var notchWidth: CGFloat = 200
     var notchHeight: CGFloat = 32
@@ -84,8 +100,18 @@ final class NotchModel: ObservableObject {
     private var todayBySession: [String: (input: Int, output: Int)] = [:]
     private var todayDate = Calendar.current.startOfDay(for: .now)
 
-    /// Character stays out of the notch while any session waits for the user.
-    var anyWaiting: Bool { sessions.contains { $0.state == .waiting } }
+    var visibleSessions: [SessionInfo] { sessions.filter(shows) }
+    var visibleCompletions: [Completion] { completions.filter { shows($0.agent) } }
+    private func shows(_ s: SessionInfo) -> Bool { shows(s.agent) }
+    private func shows(_ a: Agent) -> Bool { agentFilter == nil || agentFilter == a }
+
+    func setAgentFilter(_ a: Agent?) {
+        agentFilter = a
+        UserDefaults.standard.set(a?.rawValue, forKey: "agentFilter")
+    }
+
+    /// Character stays out of the notch while any visible session waits for the user.
+    var anyWaiting: Bool { visibleSessions.contains { $0.state == .waiting } }
 
     init() {
         refreshLimits()
@@ -96,10 +122,14 @@ final class NotchModel: ObservableObject {
 
     func handle(_ ev: HookEvent) {
         sessions.removeAll { $0.lastActivity.timeIntervalSinceNow < -8 * 3600 }
+        // filtered-out agents are still tracked (so switching the filter back is instant),
+        // but never banner, peek, or make sound
+        let shown = shows(ev.agent)
+        if shown { lastAgent = ev.agent }
         switch ev.kind {
         case .promptSubmit:
             upsert(ev) { $0.state = .working; $0.taskStartedAt = .now; $0.term = ev.term ?? $0.term }
-            peekTrigger += 1
+            if shown { peekTrigger += 1 }
         case .notification:
             // Claude Code fires this hook both for real prompts (permissions, selections —
             // always mid-turn) and for "waiting for your input" idle nags ~60s after a turn
@@ -115,10 +145,11 @@ final class NotchModel: ObservableObject {
                 // .waiting session — an idle session never fires another hook to clear it
                 upsert(ev) { $0.term = ev.term ?? $0.term }
             }
+            guard shown else { break }
             peekTrigger += 1
             showBanner(TaskEvent(title: ev.project,
-                                 subtitle: ev.message ?? "Claude needs your input",
-                                 needsInput: true, term: ev.term),
+                                 subtitle: ev.message ?? "\(ev.agent.title) needs your input",
+                                 needsInput: true, term: ev.term, agent: ev.agent),
                        for: 15, sound: "Funk")
         case .stop:
             let startedBefore = sessions.first { $0.id == ev.sessionId }?.taskStartedAt
@@ -126,28 +157,40 @@ final class NotchModel: ObservableObject {
             Task { [weak self] in
                 // transcripts grow to tens of MB — parse off the main actor
                 let stats = await Task.detached(priority: .utility) { TranscriptStats.parse(path) }.value
-                self?.applyStop(ev, stats, startedBefore: startedBefore)
+                self?.applyStop(ev, stats, startedBefore: startedBefore, shown: shown)
             }
         case .sessionEnd:
             sessions.removeAll { $0.id == ev.sessionId }
         }
     }
 
-    private func applyStop(_ ev: HookEvent, _ stats: TranscriptStats, startedBefore: Date?) {
+    private func applyStop(_ ev: HookEvent, _ stats: TranscriptStats, startedBefore: Date?, shown: Bool) {
+        var model: String?
         upsert(ev) {
             // a newer prompt may have arrived while parsing — don't clobber its working state
             if $0.taskStartedAt == startedBefore { $0.state = .idle }
             $0.model = stats.model ?? $0.model
             $0.term = ev.term ?? $0.term
+            model = $0.model
         }
-        completions.insert(Completion(project: ev.project, finishedAt: .now, usage: stats.lastUsage), at: 0)
+        completions.insert(Completion(project: ev.project, agent: ev.agent, finishedAt: .now,
+                                      usage: stats.lastUsage), at: 0)
         completions = Array(completions.prefix(5))
         addToday(session: ev.sessionId, input: stats.todayIn, output: stats.todayOut)
-        let what = stats.lastText.isEmpty ? "Task completed" : stats.lastText
+        guard shown else { return }
+        // Codex has no transcript to parse; its notify payload carries the last message instead
+        let what = stats.lastText.isEmpty ? (ev.message.map(TranscriptStats.summary) ?? "Task completed") : stats.lastText
         let subtitle = stats.lastUsage.isEmpty ? what : "\(what) · \(stats.lastUsage)"
-        showBanner(TaskEvent(title: ev.project, subtitle: subtitle, term: ev.term),
+        var meta = model?.replacingOccurrences(of: "claude-", with: "")
+        if let start = startedBefore {
+            let s = Int(-start.timeIntervalSinceNow)
+            meta = [meta, s >= 60 ? "\(s / 60)m\(String(format: "%02d", s % 60))s" : "\(s)s"]
+                .compactMap { $0 }.joined(separator: " · ")
+        }
+        showBanner(TaskEvent(title: ev.project, subtitle: subtitle, term: ev.term, agent: ev.agent,
+                             meta: meta, pct: stats.contextPct > 0 ? stats.contextPct : nil),
                    for: 9, sound: "Pop")
-        refreshLimits()
+        if ev.agent == .claude { refreshLimits() }
     }
 
     private func upsert(_ ev: HookEvent, _ mutate: (inout SessionInfo) -> Void) {
@@ -155,7 +198,7 @@ final class NotchModel: ObservableObject {
             sessions[i].lastActivity = .now
             mutate(&sessions[i])
         } else {
-            var s = SessionInfo(id: ev.sessionId, project: ev.project, state: .idle,
+            var s = SessionInfo(id: ev.sessionId, project: ev.project, agent: ev.agent, state: .idle,
                                 model: nil, taskStartedAt: nil, lastActivity: .now)
             mutate(&s)
             sessions.insert(s, at: 0)
@@ -312,6 +355,13 @@ struct TranscriptStats {
     var model: String?
     var todayIn = 0
     var todayOut = 0
+    var contextPct = 0.0 // last turn's input vs a 200k window
+
+    /// First line, truncated — same shape for transcript text and Codex's last message.
+    static func summary(_ text: String) -> String {
+        let line = text.split(separator: "\n").first.map(String.init) ?? ""
+        return line.count > 70 ? String(line.prefix(70)) + "…" : line
+    }
 
     static func parse(_ path: String?) -> TranscriptStats {
         var s = TranscriptStats()
@@ -331,10 +381,10 @@ struct TranscriptStats {
             guard fresh + cached + output > 0 else { continue }
             s.model = msg["model"] as? String ?? s.model
             s.lastUsage = "\(fmtTokens(fresh + cached))↑ \(fmtTokens(output))↓ tokens"
+            s.contextPct = min(1, Double(fresh + cached) / 200_000)
             if let content = msg["content"] as? [[String: Any]],
                let text = content.last(where: { $0["type"] as? String == "text" })?["text"] as? String {
-                let line = text.split(separator: "\n").first.map(String.init) ?? ""
-                s.lastText = line.count > 70 ? String(line.prefix(70)) + "…" : line
+                s.lastText = summary(text)
             }
             // today totals count fresh input + output (cache reads excluded — cheap and huge)
             if let ts = obj["timestamp"] as? String,
@@ -348,7 +398,7 @@ struct TranscriptStats {
     }
 }
 
-/// Watches ~/.notchification/events/ — Claude Code hooks drop one JSON file per event.
+/// Watches ~/.notchification/events/ — Claude Code hooks (and Codex `notify`) drop one JSON file per event.
 final class EventWatcher {
     private let dir = FileManager.default.homeDirectoryForCurrentUser
         .appending(path: ".notchification/events")
@@ -388,33 +438,51 @@ final class EventWatcher {
         where url.pathExtension == "json" {
             defer { try? FileManager.default.removeItem(at: url) }
             guard let data = try? Data(contentsOf: url),
-                  var obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let ev = Self.parse(obj)
             else { continue }
-            // hooks wrap the Claude Code JSON with terminal identity: {term_program, kitty_win, kitty_sock, payload}
-            var term: TermInfo?
-            if let payload = obj["payload"] as? [String: Any] {
-                term = TermInfo(program: obj["term_program"] as? String,
-                                kittyWin: obj["kitty_win"] as? String,
-                                kittySock: obj["kitty_sock"] as? String)
-                obj = payload
-            }
-            let kind: HookEvent.Kind
-            switch obj["hook_event_name"] as? String {
-            case "UserPromptSubmit": kind = .promptSubmit
-            case "Stop": kind = .stop
-            case "SessionEnd": kind = .sessionEnd
-            case "Notification": kind = .notification
-            default: continue
-            }
-            let cwd = (obj["cwd"] as? String ?? "") as NSString
-            let project = cwd.lastPathComponent.isEmpty ? "Claude Code" : cwd.lastPathComponent
-            events.append(HookEvent(kind: kind,
-                                    sessionId: obj["session_id"] as? String ?? UUID().uuidString,
-                                    project: project,
-                                    transcriptPath: obj["transcript_path"] as? String,
-                                    message: obj["message"] as? String,
-                                    term: term))
+            events.append(ev)
         }
         if !events.isEmpty { onEvent(events) }
+    }
+
+    /// One event file → HookEvent. Accepts Claude Code hook JSON (optionally wrapped with terminal
+    /// identity: {term_program, kitty_win, kitty_sock, agent?, cwd?, payload}) and Codex CLI's
+    /// `notify` payload ({type: "agent-turn-complete", thread-id, last-assistant-message, cwd?}).
+    static func parse(_ raw: [String: Any]) -> HookEvent? {
+        let outer = raw
+        var obj = raw
+        var term: TermInfo?
+        if let payload = obj["payload"] as? [String: Any] {
+            term = TermInfo(program: obj["term_program"] as? String,
+                            kittyWin: obj["kitty_win"] as? String,
+                            kittySock: obj["kitty_sock"] as? String)
+            obj = payload
+        }
+        let agent = ((outer["agent"] ?? obj["agent"]) as? String).flatMap { Agent(rawValue: $0.lowercased()) }
+        let kind: HookEvent.Kind
+        var sessionId = obj["session_id"] as? String
+        var message = obj["message"] as? String
+        switch obj["hook_event_name"] as? String {
+        case "UserPromptSubmit": kind = .promptSubmit
+        case "Stop": kind = .stop
+        case "SessionEnd": kind = .sessionEnd
+        case "Notification": kind = .notification
+        default:
+            guard obj["type"] as? String == "agent-turn-complete" else { return nil }
+            kind = .stop
+            sessionId = obj["thread-id"] as? String
+            message = obj["last-assistant-message"] as? String
+        }
+        let resolved = agent ?? (obj["type"] != nil ? .codex : .claude)
+        let cwd = ((obj["cwd"] ?? outer["cwd"]) as? String ?? "") as NSString
+        let project = cwd.lastPathComponent.isEmpty ? "\(resolved.title) Code" : cwd.lastPathComponent
+        return HookEvent(kind: kind,
+                         sessionId: sessionId ?? UUID().uuidString,
+                         project: project,
+                         transcriptPath: obj["transcript_path"] as? String,
+                         message: message,
+                         term: term,
+                         agent: resolved)
     }
 }
