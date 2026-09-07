@@ -1,10 +1,23 @@
 import SwiftUI
 
+/// Design 3 "Obsidian Liquid": near-opaque black glass, specular rim, liquid accent, ring gauges.
+enum Theme {
+    static let warn = Color(red: 1, green: 0.83, blue: 0.3)
+    static let dim = Color.white.opacity(0.4)
+
+    static func accent(_ a: Agent) -> Color {
+        a == .claude ? Color(red: 1.0, green: 0.55, blue: 0.1) : Color(red: 0.17, green: 0.78, blue: 0.62)
+    }
+    static func accentDark(_ a: Agent) -> Color {
+        a == .claude ? Color(red: 0.85, green: 0.4, blue: 0.05) : Color(red: 0.08, green: 0.55, blue: 0.43)
+    }
+    static func mono(_ size: CGFloat, _ weight: Font.Weight = .medium) -> Font {
+        .system(size: size, weight: weight, design: .monospaced)
+    }
+}
+
 // ponytail: placeholder pixel art, swap maps when real character sheets arrive
 enum Sprite {
-    static let orange = Color(red: 1.0, green: 0.55, blue: 0.1)
-    static let dimText = Color.white.opacity(0.45)
-
     static let walkA = [
         "....oo......",
         "....oO......",
@@ -45,10 +58,11 @@ enum Sprite {
         "..oo..oo....",
     ]
 
-    static func color(_ c: Character) -> Color? {
+    /// Same sprite, tinted per agent.
+    static func color(_ c: Character, _ agent: Agent = .claude) -> Color? {
         switch c {
-        case "O": return orange
-        case "o": return Color(red: 0.85, green: 0.4, blue: 0.05)
+        case "O": return Theme.accent(agent)
+        case "o": return Theme.accentDark(agent)
         case "W": return .white
         case "B": return .black
         default: return nil
@@ -58,6 +72,7 @@ enum Sprite {
 
 struct PixelSprite: View {
     let map: [String]
+    var agent: Agent = .claude
     var scale: CGFloat = 2
     var flipped = false
 
@@ -66,7 +81,7 @@ struct PixelSprite: View {
             let cols = map[0].count
             for (y, row) in map.enumerated() {
                 for (x, ch) in row.enumerated() {
-                    guard let c = Sprite.color(ch) else { continue }
+                    guard let c = Sprite.color(ch, agent) else { continue }
                     let px = flipped ? cols - 1 - x : x
                     ctx.fill(Path(CGRect(x: CGFloat(px) * scale, y: CGFloat(y) * scale,
                                          width: scale, height: scale)),
@@ -77,6 +92,96 @@ struct PixelSprite: View {
         .frame(width: CGFloat(map[0].count) * scale, height: CGFloat(map.count) * scale)
     }
 }
+
+// MARK: - Glass primitives
+
+/// Obsidian glass card hanging from the notch: 90% black, specular top band,
+/// liquid accent pooling bottom-right (and optionally bottom-left), hairline gradient rim.
+/// No SwiftUI material: on macOS it blends behind the whole window rectangle, not the clipped shape.
+struct Obsidian: View {
+    let accent: Color
+    var accent2: Color?
+    var radius: CGFloat = 30
+
+    var body: some View {
+        // No drop shadow: `.shadow()` and any unclipped `.blur()` rasterize the whole
+        // transparent window and show up as a faint grey rectangle around the card.
+        let shape = UnevenRoundedRectangle(bottomLeadingRadius: radius, bottomTrailingRadius: radius)
+        ZStack {
+            shape.fill(Color(red: 0.02, green: 0.02, blue: 0.03).opacity(0.9))
+            LinearGradient(colors: [.white.opacity(0.14), .clear], startPoint: .top, endPoint: .bottom)
+                .frame(height: 70)
+                .frame(maxHeight: .infinity, alignment: .top)
+            Ellipse().fill(accent)
+                .frame(width: 220, height: 90).blur(radius: 30).opacity(0.55)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomTrailing)
+                .offset(x: 40, y: 30)
+            if let accent2 {
+                Ellipse().fill(accent2)
+                    .frame(width: 180, height: 80).blur(radius: 30).opacity(0.4)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
+                    .offset(x: -40, y: 30)
+            }
+            LinearGradient(colors: [accent.opacity(0), accent.opacity(0.9), accent.opacity(0)],
+                           startPoint: .leading, endPoint: .trailing)
+                .frame(height: 2)
+                .frame(maxHeight: .infinity, alignment: .bottom)
+        }
+        .clipShape(shape)
+        .overlay(shape.strokeBorder(
+            LinearGradient(stops: [.init(color: .white.opacity(0.55), location: 0),
+                                   .init(color: .white.opacity(0.08), location: 0.35),
+                                   .init(color: .white.opacity(0.03), location: 1)],
+                           startPoint: .top, endPoint: .bottom),
+            lineWidth: 1))
+    }
+}
+
+struct AgentBadge: View {
+    let agent: Agent
+    var body: some View {
+        Text(agent.rawValue)
+            .font(Theme.mono(9))
+            .foregroundStyle(Theme.accent(agent))
+            .padding(.horizontal, 6).padding(.vertical, 2)
+            .background(RoundedRectangle(cornerRadius: 6).fill(Theme.accent(agent).opacity(0.1)))
+            .overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(Theme.accent(agent).opacity(0.4), lineWidth: 1))
+    }
+}
+
+/// Ring gauge (context usage, limits).
+struct Ring: View {
+    let pct: Double
+    let accent: Color
+    var size: CGFloat = 30
+    var label: String?
+
+    var body: some View {
+        let w = size * 0.11
+        ZStack {
+            Circle().stroke(.white.opacity(0.12), lineWidth: w)
+            Circle().trim(from: 0, to: min(max(pct, 0.005), 1))
+                .stroke(accent, style: StrokeStyle(lineWidth: w, lineCap: .round))
+                .rotationEffect(.degrees(-90))
+                .shadow(color: accent.opacity(0.6), radius: 4)
+            if let label {
+                Text(label).font(Theme.mono(size * 0.27)).foregroundStyle(.white.opacity(0.85))
+            }
+        }
+        .frame(width: size, height: size)
+    }
+}
+
+struct GlowDot: View {
+    let color: Color
+    var glow = true
+    var body: some View {
+        Circle().fill(color).frame(width: 6, height: 6)
+            .shadow(color: glow ? color.opacity(0.9) : .clear, radius: 4)
+    }
+}
+
+// MARK: - Hosts
 
 struct OverlayView: View {
     @ObservedObject var model: NotchModel
@@ -111,28 +216,6 @@ struct BannerHost: View {
     }
 }
 
-/// Claude Code-style context usage bar.
-struct ContextBar: View {
-    let pct: Double
-
-    var body: some View {
-        HStack(spacing: 6) {
-            GeometryReader { g in
-                ZStack(alignment: .leading) {
-                    Capsule().fill(Color.white.opacity(0.15))
-                    Capsule()
-                        .fill(pct > 0.8 ? Color.red : Sprite.orange)
-                        .frame(width: max(3, g.size.width * min(pct, 1)))
-                }
-            }
-            .frame(height: 4)
-            Text("\(Int(pct * 100))%")
-                .font(.system(size: 9, weight: .medium).monospacedDigit())
-                .foregroundStyle(Sprite.dimText)
-        }
-    }
-}
-
 /// Hidden by default. On a task event it walks ~80px out of the notch, lingers, walks back in.
 /// While any session waits for user input it stays out, pacing, until answered.
 struct PeekingCharacter: View {
@@ -149,7 +232,7 @@ struct PeekingCharacter: View {
     enum Phase { case hidden, exiting, waiting, returning }
 
     var body: some View {
-        PixelSprite(map: currentMap, flipped: dir < 0)
+        PixelSprite(map: currentMap, agent: model.lastAgent, flipped: dir < 0)
             .position(x: width / 2 + x, y: model.notchHeight - 11)
             .opacity(phase == .hidden ? 0 : 1)
             .onReceive(timer) { _ in tick() }
@@ -206,61 +289,88 @@ struct PeekingCharacter: View {
     }
 }
 
-/// Dynamic-island-style banner extending down from the notch.
+// MARK: - Banner
+
+/// Obsidian banner extending down from the notch.
 struct Banner: View {
     let event: TaskEvent
     @ObservedObject var model: NotchModel
     @State private var bob = false
 
     var body: some View {
+        let accent = Theme.accent(event.agent)
         HStack(spacing: 12) {
-            PixelSprite(map: Sprite.walkA, scale: 2)
+            PixelSprite(map: Sprite.walkA, agent: event.agent, scale: 3)
                 .offset(y: bob ? -2 : 2)
                 .animation(.easeInOut(duration: 0.5).repeatForever(autoreverses: true), value: bob)
                 .onAppear { bob = true }
-            VStack(alignment: .leading, spacing: 2) {
-                Text(event.title)
-                    .font(.system(size: 13, weight: .semibold))
-                    .foregroundStyle(.white)
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(spacing: 8) {
+                    Text(event.title)
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(.white)
+                    AgentBadge(agent: event.agent)
+                    if event.needsInput {
+                        HStack(spacing: 4) {
+                            GlowDot(color: Theme.warn)
+                            Text("needs input").font(Theme.mono(9)).foregroundStyle(Theme.warn)
+                        }
+                    } else if let meta = event.meta {
+                        Text(meta).font(Theme.mono(9)).foregroundStyle(Theme.dim)
+                    }
+                }
                 Text(event.subtitle)
-                    .font(.system(size: 11, weight: .medium))
-                    .foregroundStyle(event.needsInput ? .yellow : Sprite.orange)
+                    .font(Theme.mono(10))
+                    .foregroundStyle(.white.opacity(0.7))
                     .lineLimit(2)
             }
+            Spacer(minLength: 8)
+            if event.needsInput {
+                Text("open ↗")
+                    .font(Theme.mono(9))
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 10).padding(.vertical, 6)
+                    .background(Capsule().fill(LinearGradient(colors: [.white.opacity(0.2), .white.opacity(0.06)],
+                                                              startPoint: .top, endPoint: .bottom)))
+                    .overlay(Capsule().strokeBorder(.white.opacity(0.3), lineWidth: 1))
+            } else if let pct = event.pct {
+                Ring(pct: pct, accent: accent, label: "\(Int(pct * 100))")
+            }
         }
-        .padding(.horizontal, 18)
-        .padding(.top, model.notchHeight + 8)
-        .padding(.bottom, 12)
-        .frame(minWidth: model.notchWidth + 60, maxWidth: 420)
-        .background(
-            UnevenRoundedRectangle(bottomLeadingRadius: 18, bottomTrailingRadius: 18)
-                .fill(.black)
-        )
+        .padding(.horizontal, 16)
+        .padding(.top, model.notchHeight + 10)
+        .padding(.bottom, 14)
+        .frame(minWidth: model.notchWidth + 60, maxWidth: 460)
+        .background(Obsidian(accent: accent))
     }
 }
 
-/// Hover panel: sessions now, recent completions, today's totals.
+// MARK: - Hover panel
+
+/// Hover panel: sessions now, limits, recent completions, today's totals.
 struct ExpandedView: View {
     @ObservedObject var model: NotchModel
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            sectionLabel("NOW")
-            if model.sessions.isEmpty {
-                Text("No active sessions")
-                    .font(.system(size: 11)).foregroundStyle(Sprite.dimText)
+            HStack {
+                sectionLabel("NOW")
+                Spacer()
+                if let f = model.agentFilter {
+                    Text("showing \(f.rawValue)").font(Theme.mono(8)).foregroundStyle(Theme.accent(f).opacity(0.8))
+                }
             }
-            ForEach(model.sessions) { s in
+            if model.visibleSessions.isEmpty {
+                Text("No active sessions").font(Theme.mono(9)).foregroundStyle(Theme.dim)
+            }
+            ForEach(model.visibleSessions) { s in
                 HStack(spacing: 8) {
-                    Circle()
-                        .fill(dotColor(s.state))
-                        .frame(width: 6, height: 6)
-                    Text(s.project)
-                        .font(.system(size: 12, weight: .semibold))
-                        .foregroundStyle(.white)
+                    GlowDot(color: dotColor(s), glow: s.state != .idle)
+                    Text(s.project).font(.system(size: 12, weight: .semibold)).foregroundStyle(.white)
+                    AgentBadge(agent: s.agent)
                     if let m = s.model {
                         Text(m.replacingOccurrences(of: "claude-", with: ""))
-                            .font(.system(size: 10)).foregroundStyle(Sprite.dimText)
+                            .font(Theme.mono(9)).foregroundStyle(Theme.dim)
                     }
                     Spacer()
                     stateText(s)
@@ -269,38 +379,44 @@ struct ExpandedView: View {
 
             divider
             sectionLabel("LIMITS")
-            if model.limits.isEmpty {
-                Text("No limit data")
-                    .font(.system(size: 11)).foregroundStyle(Sprite.dimText)
-            }
-            ForEach(model.limits) { b in
-                HStack(spacing: 8) {
-                    Text(b.label)
-                        .font(.system(size: 11, weight: .medium)).foregroundStyle(.white)
-                        .frame(width: 100, alignment: .leading)
-                    ContextBar(pct: b.pct)
-                    if let r = b.resetsAt {
-                        Text(resetText(r))
-                            .font(.system(size: 9)).foregroundStyle(Sprite.dimText)
+            if model.agentFilter == .codex {
+                Text("codex limits unavailable").font(Theme.mono(9)).foregroundStyle(Theme.dim)
+            } else if model.limits.isEmpty {
+                Text("No limit data").font(Theme.mono(9)).foregroundStyle(Theme.dim)
+            } else {
+                // plain stacks, not LazyVGrid: lazy cells animate their own insertion, which
+                // reads as "fading up" against the panel sliding down
+                ForEach(Array(stride(from: 0, to: model.limits.count, by: 3)), id: \.self) { i in
+                    HStack(spacing: 10) {
+                        ForEach(model.limits[i..<min(i + 3, model.limits.count)]) { b in
+                            HStack(spacing: 10) {
+                                Ring(pct: b.pct, accent: b.pct > 0.8 ? .red : Theme.accent(.claude), size: 34)
+                                VStack(alignment: .leading, spacing: 1) {
+                                    Text("\(Int(b.pct * 100))%").font(Theme.mono(12)).foregroundStyle(.white)
+                                    Text(b.label).font(.system(size: 9, weight: .medium)).foregroundStyle(.white.opacity(0.75))
+                                    if let r = b.resetsAt {
+                                        Text(resetText(r)).font(.system(size: 8)).foregroundStyle(Theme.dim)
+                                    }
+                                }
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                        }
                     }
                 }
             }
 
             divider
             sectionLabel("RECENT")
-            if model.completions.isEmpty {
-                Text("Nothing finished yet")
-                    .font(.system(size: 11)).foregroundStyle(Sprite.dimText)
+            if model.visibleCompletions.isEmpty {
+                Text("Nothing finished yet").font(Theme.mono(9)).foregroundStyle(Theme.dim)
             }
-            ForEach(model.completions) { c in
-                HStack {
-                    Text(c.project)
-                        .font(.system(size: 11, weight: .medium)).foregroundStyle(.white)
+            ForEach(model.visibleCompletions) { c in
+                HStack(spacing: 8) {
+                    Text(c.project).font(.system(size: 11, weight: .medium)).foregroundStyle(.white)
+                    AgentBadge(agent: c.agent)
                     Spacer()
-                    Text(ago(c.finishedAt))
-                        .font(.system(size: 10)).foregroundStyle(Sprite.dimText)
-                    Text(c.usage)
-                        .font(.system(size: 10, weight: .medium)).foregroundStyle(Sprite.orange)
+                    Text(ago(c.finishedAt)).font(Theme.mono(9)).foregroundStyle(Theme.dim)
+                    Text(c.usage).font(Theme.mono(9)).foregroundStyle(Theme.accent(c.agent))
                 }
             }
 
@@ -308,33 +424,32 @@ struct ExpandedView: View {
             HStack {
                 sectionLabel("TODAY")
                 Spacer()
-                Text("\(fmtTokens(model.todayIn))↑ \(fmtTokens(model.todayOut))↓ tokens")
-                    .font(.system(size: 11, weight: .semibold)).foregroundStyle(Sprite.orange)
+                Text("\(fmtTokens(model.todayIn))↑ \(fmtTokens(model.todayOut))↓")
+                    .font(Theme.mono(11)).foregroundStyle(.white)
             }
         }
         .padding(.horizontal, 20)
-        .padding(.top, model.notchHeight + 10)
-        .padding(.bottom, 14)
-        .frame(width: 380, alignment: .leading)
-        .background(
-            UnevenRoundedRectangle(bottomLeadingRadius: 22, bottomTrailingRadius: 22)
-                .fill(.black)
-        )
+        .padding(.top, model.notchHeight + 12)
+        .padding(.bottom, 16)
+        .frame(width: 400, alignment: .leading)
+        .background(Obsidian(accent: Theme.accent(model.agentFilter ?? .claude),
+                             accent2: model.agentFilter == nil ? Theme.accent(.codex) : nil,
+                             radius: 32))
     }
 
     private var divider: some View {
-        Rectangle().fill(Color.white.opacity(0.12)).frame(height: 1).padding(.vertical, 2)
+        Rectangle().fill(Color.white.opacity(0.08)).frame(height: 1).padding(.vertical, 2)
     }
 
     private func sectionLabel(_ t: String) -> some View {
-        Text(t).font(.system(size: 9, weight: .bold)).foregroundStyle(Sprite.dimText).kerning(1)
+        Text(t).font(Theme.mono(8)).foregroundStyle(.white.opacity(0.38)).kerning(1.2)
     }
 
-    private func dotColor(_ s: SessionInfo.State) -> Color {
-        switch s {
-        case .working: return Sprite.orange
-        case .waiting: return .yellow
-        case .idle: return .gray
+    private func dotColor(_ s: SessionInfo) -> Color {
+        switch s.state {
+        case .working: return Theme.accent(s.agent)
+        case .waiting: return Theme.warn
+        case .idle: return Color(white: 0.45)
         }
     }
 
@@ -344,30 +459,29 @@ struct ExpandedView: View {
         case .working:
             if let start = s.taskStartedAt {
                 TimelineView(.periodic(from: .now, by: 1)) { _ in
-                    Text("working · \(elapsed(start))")
-                        .font(.system(size: 10).monospacedDigit()).foregroundStyle(Sprite.orange)
+                    Text("working \(elapsed(start))")
+                        .font(Theme.mono(9)).foregroundStyle(Theme.accent(s.agent))
                 }
             } else {
-                Text("working").font(.system(size: 10)).foregroundStyle(Sprite.orange)
+                Text("working").font(Theme.mono(9)).foregroundStyle(Theme.accent(s.agent))
             }
         case .waiting:
-            Text("needs input")
-                .font(.system(size: 10, weight: .semibold)).foregroundStyle(.yellow)
+            Text("needs input").font(Theme.mono(9)).foregroundStyle(Theme.warn)
         case .idle:
-            Text("idle").font(.system(size: 10)).foregroundStyle(Sprite.dimText)
+            Text("idle").font(Theme.mono(9)).foregroundStyle(Theme.dim)
         }
     }
 
     private func elapsed(_ d: Date) -> String {
         let s = Int(-d.timeIntervalSinceNow)
-        return s >= 60 ? "\(s / 60)m \(s % 60)s" : "\(s)s"
+        return s >= 60 ? "\(s / 60)m\(String(format: "%02d", s % 60))s" : "\(s)s"
     }
 
     private func ago(_ d: Date) -> String {
         let m = Int(-d.timeIntervalSinceNow) / 60
         if m < 1 { return "now" }
-        if m < 60 { return "\(m)m ago" }
-        return "\(m / 60)h ago"
+        if m < 60 { return "\(m)m" }
+        return "\(m / 60)h"
     }
 
     private func resetText(_ d: Date) -> String {
