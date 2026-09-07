@@ -104,15 +104,9 @@ struct Obsidian: View {
     var radius: CGFloat = 30
 
     var body: some View {
+        // No drop shadow: `.shadow()` and any unclipped `.blur()` rasterize the whole
+        // transparent window and show up as a faint grey rectangle around the card.
         let shape = UnevenRoundedRectangle(bottomLeadingRadius: radius, bottomTrailingRadius: radius)
-        ZStack {
-            // soft drop shadow — `.shadow()` rasterizes the whole transparent window as a grey rectangle
-            shape.fill(.black.opacity(0.55)).blur(radius: 14).offset(y: 8)
-            card(shape)
-        }
-    }
-
-    private func card(_ shape: UnevenRoundedRectangle) -> some View {
         ZStack {
             shape.fill(Color(red: 0.02, green: 0.02, blue: 0.03).opacity(0.9))
             LinearGradient(colors: [.white.opacity(0.14), .clear], startPoint: .top, endPoint: .bottom)
